@@ -1,0 +1,172 @@
+#commit 3bc28e9d1ab33627cea3c632dd6b0c33e22e93ba
+diff --git a/fftools/ffmpeg.c b/fftools/ffmpeg.c
+index bdeff9a12e..25556728e4 100644
+--- a/fftools/ffmpeg.c
++++ b/fftools/ffmpeg.c
+@@ -158,6 +158,8 @@ int         nb_output_files   = 0;
+ FilterGraph **filtergraphs;
+ int        nb_filtergraphs;
+ 
++static volatile WriteLatency write_latency;
++
+ #if HAVE_TERMIOS_H
+ 
+ /* init terminal so that we can grab keys */
+@@ -511,6 +513,7 @@ static int decode_interrupt_cb(void *ctx)
+ }
+ 
+ const AVIOInterruptCB int_cb = { decode_interrupt_cb, NULL };
++const AVIOProbeCB sent_cb = {sent_delay_cb, &write_latency };
+ 
+ static void ffmpeg_cleanup(int ret)
+ {
+@@ -661,6 +664,8 @@ static void ffmpeg_cleanup(int ret)
+ 
+     avformat_network_deinit();
+ 
++    uninit_log();
++
+     if (received_sigterm) {
+         av_log(NULL, AV_LOG_INFO, "Exiting normally, received signal %d.\n",
+                (int) received_sigterm);
+@@ -846,6 +851,7 @@ static void write_packet(OutputFile *of, AVPacket *pkt, OutputStream *ost, int u
+     ost->last_mux_dts = pkt->dts;
+ 
+     ost->data_size += pkt->size;
++    pkt->pkt_number = ost->packets_written;
+     ost->packets_written++;
+ 
+     pkt->stream_index = ost->index;
+@@ -2952,6 +2958,7 @@ static int check_init_output_file(OutputFile *of, int file_index)
+     }
+ 
+     of->ctx->interrupt_callback = int_cb;
++    of->ctx->probe_callback = sent_cb;
+ 
+     ret = avformat_write_header(of->ctx, &of->opts);
+     if (ret < 0) {
+@@ -4301,6 +4308,7 @@ static int process_input(int file_index)
+     ist = input_streams[ifile->ist_index + pkt->stream_index];
+ 
+     ist->data_size += pkt->size;
++    pkt->pkt_number = ist->nb_packets;
+     ist->nb_packets++;
+ 
+     if (ist->discard)
+@@ -4313,6 +4321,10 @@ static int process_input(int file_index)
+             exit_program(1);
+     }
+ 
++    ret = delay_calc(ist->dec_ctx->codec_type, pkt, &write_latency);
++    if (ret < 0)
++        av_log(NULL, AV_LOG_WARNING, "Possibly incorrect delay_calc return.\n");
++
+     if (debug_ts) {
+         av_log(NULL, AV_LOG_INFO, "demuxer -> ist_index:%d type:%s "
+                "next_dts:%s next_dts_time:%s next_pts:%s next_pts_time:%s pkt_pts:%s pkt_pts_time:%s pkt_dts:%s pkt_dts_time:%s off:%s off_time:%s\n",
+diff --git a/fftools/ffmpeg.h b/fftools/ffmpeg.h
+index 9b200b806a..0fdc29bc5c 100644
+--- a/fftools/ffmpeg.h
++++ b/fftools/ffmpeg.h
+@@ -46,6 +46,7 @@
+ #include "libavutil/threadmessage.h"
+ 
+ #include "libswresample/swresample.h"
++#include "innovation_challenge.h"
+ 
+ enum VideoSyncMethod {
+     VSYNC_AUTO = -1,
+diff --git a/fftools/ffmpeg_opt.c b/fftools/ffmpeg_opt.c
+index 9c820ab73f..3bb089568f 100644
+--- a/fftools/ffmpeg_opt.c
++++ b/fftools/ffmpeg_opt.c
+@@ -1081,6 +1081,8 @@ static int open_input_file(OptionsContext *o, const char *filename)
+     char *    data_codec_name = NULL;
+     int scan_all_pmts_set = 0;
+ 
++    init_log(filename);
++
+     if (o->stop_time != INT64_MAX && o->recording_time != INT64_MAX) {
+         o->stop_time = INT64_MAX;
+         av_log(NULL, AV_LOG_WARNING, "-t and -to cannot be used together; using -t.\n");
+diff --git a/libavcodec/packet.h b/libavcodec/packet.h
+index 4a349fe051..bd1ac0b9c9 100644
+--- a/libavcodec/packet.h
++++ b/libavcodec/packet.h
+@@ -415,6 +415,8 @@ typedef struct AVPacket {
+      * or muxers.
+      */
+     AVRational time_base;
++
++    int64_t pkt_number;
+ } AVPacket;
+ 
+ #if FF_API_INIT_PACKET
+diff --git a/libavformat/avformat.h b/libavformat/avformat.h
+index 6ce367e854..da3c626ea8 100644
+--- a/libavformat/avformat.h
++++ b/libavformat/avformat.h
+@@ -1468,6 +1468,15 @@ typedef struct AVFormatContext {
+      */
+     AVIOInterruptCB interrupt_callback;
+ 
++    /*
++     * Custom probe callbacks for the I/O layer.
++     *
++     * demuxing: not used.
++     * muxing: set by the user before av_interleaved_write_frame().
++     * The callback is used as probe to detect the status during muxing.
++     */
++    AVIOProbeCB probe_callback;
++
+     /**
+      * Flags to enable debugging.
+      */
+diff --git a/libavformat/avio.h b/libavformat/avio.h
+index cd63322a62..e0cfbac80b 100644
+--- a/libavformat/avio.h
++++ b/libavformat/avio.h
+@@ -60,6 +60,24 @@ typedef struct AVIOInterruptCB {
+     void *opaque;
+ } AVIOInterruptCB;
+ 
++/**
++ * Callback for checking whether to send notify information.
++ * During the opreations, callback is called with opaque and
++ * opaque_ext as parameters.
++ *
++ * Identical to AVIOInterruptCB, extended to be able to pass
++ * 2 pointers.
++ *
++ * Note that it's not a typical interrupt and is used as a probe
++ * to detect the status of opaques during the operations of
++ * libavformat or libavio.
++ */
++typedef struct AVIOProbeCB {
++    int (*callback)(void*, void*);
++    void *opaque;
++    void *opaque_ext;
++} AVIOProbeCB;
++
+ /**
+  * Directory entry types.
+  */
+diff --git a/libavformat/mux.c b/libavformat/mux.c
+index c387f8ec6e..188bb8ab09 100644
+--- a/libavformat/mux.c
++++ b/libavformat/mux.c
+@@ -1090,6 +1090,14 @@ static int interleaved_write_packet(AVFormatContext *s, AVPacket *pkt,
+         has_packet = 0;
+ 
+         ret = write_packet(s, pkt);
++
++        // probe and check the status of opkt
++        if (s->probe_callback.callback) {
++            int cb_ret = s->probe_callback.callback(s->probe_callback.opaque, (void *)pkt);
++            if (cb_ret)
++                av_log(s, AV_LOG_WARNING, "Possibly incorrect probe callback return: %d.\n", cb_ret);
++        }
++
+         av_packet_unref(pkt);
+         if (ret < 0)
+             return ret;
